@@ -1,6 +1,6 @@
 # ComfyUI-H3-DualGPU-FixedSlot
 
-MiniMax-H3（Ref2VA / FL2VA）双卡**固定槽权重流水**推理节点包——单卡算全部层，但权重换装（磁盘预读 → 主机槽 → GPU A/B 双槽轮换）与计算完全异步重叠；副卡承载 TE 编码。
+MiniMax-H3（Ref2VA / FL2VA）双卡**固定槽权重流水**推理节点包——单卡算全部层，但权重保留在显存与计算完全异步重叠；副卡承载 TE 编码。
 
 ## 思路
 
@@ -28,12 +28,12 @@ MiniMax-H3（Ref2VA / FL2VA）双卡**固定槽权重流水**推理节点包—�
 
 | 模式 | 开关 | 说明 |
 |---|---|---|
-| **bf16 烘焙直存**（默认） | 无 | 权重烘焙为 bf16 直存，运行时零转换，与基线 1ulp 内一致 |
-| **int8 槽** | `H3_SLOT_INT8=1` | 原作者原设计：int8 量化 kernel 直算，槽仅 1.08 GiB |
+| **bf16 烘焙直存**（默认） | 无 | 权重烘焙为 bf16 直存直算 |
+| **int8 槽** | `H3_SLOT_INT8=1` | int8 量化 kernel 直算 |
 
 其他环境变量：
-- `H3_LAST_ON_SEC=1`：末层放副卡（原作者布局；本机副卡被 TE 占用时不可用）
-- `CUDA_VISIBLE_DEVICES=1,0`：3080 当主卡（大 token 场景，20G 显存）
+- `H3_LAST_ON_SEC=1`：末层放副卡
+- `CUDA_VISIBLE_DEVICES=1,0`：3080 当主卡
 
 ## 节点
 
