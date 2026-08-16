@@ -58,3 +58,7 @@ H3_SLOT_INT8=1 H3_LAST_ON_SEC=1 ./python_embeded/python.exe -s ComfyUI/main.py  
 
 - 权重格式：**int8_convrot**（Ref2VA / FL2VA 的 `*_pruned_int8_convrot.safetensors` 官方版）
 - FL2VA 需用官方 int8_convrot 版（w4a8_mixed codebook 格式暂不兼容）
+
+## 致谢
+
+固定槽双卡流水思路来自 B 站 UP 主：[空间链接](https://space.bilibili.com/3493120159255008)（UID: 3493120159255008），感谢分享双卡串行固定槽架构。
