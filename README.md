@@ -24,16 +24,12 @@ MiniMax-H3（Ref2VA / FL2VA）双卡推理节点——单卡算全部层，但�
 | 单卡 5070Ti 原版 | 58.6 s/it | 基准 |
 | 单卡 3080 原版 | 91.7 s/it | 基准 |
 
-## 双模式
+## 节点
 
-| 模式 | 开关 | 说明 |
-|---|---|---|
-| **bf16 烘焙直存**（默认） | 无 | 权重烘焙为 bf16 直存直算 |
-| **int8 槽** | `H3_SLOT_INT8=1` | int8 量化 kernel 直算 |
+- `H3DualGPUPipeline` —— 主卡层 0-48 固定槽流水 + 层 49 主卡 B 槽（`H3_LAST_ON_SEC=1` 可切副卡）
+- `H3TESecondaryGPU` —— TE 加载到副卡 + 编码完成自动卸载
+<img width="1350" height="1143" alt="image" src="https://github.com/user-attachments/assets/1005cdb7-3bae-44fe-ace3-1eb32b42e581" />
 
-其他环境变量：
-- `H3_LAST_ON_SEC=1`：末层放副卡
-- `CUDA_VISIBLE_DEVICES=1,0`：切换主卡
 
 ## 启动命令示例
 
@@ -51,10 +47,6 @@ CUDA_VISIBLE_DEVICES=1,0 ./python_embeded/python.exe -s ComfyUI/main.py   --port
 H3_SLOT_INT8=1 H3_LAST_ON_SEC=1 ./python_embeded/python.exe -s ComfyUI/main.py   --port 5071 --use-sage-attention --disable-dynamic-vram
 ```
 
-## 节点
-
-- `H3DualGPUPipeline` —— 主卡层 0-48 固定槽流水 + 层 49 主卡 B 槽（`H3_LAST_ON_SEC=1` 可切副卡）
-- `H3TESecondaryGPU` —— TE 加载到副卡 + 编码完成自动卸载
 
 ## 依赖
 
