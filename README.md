@@ -33,7 +33,7 @@ MiniMax-H3（Ref2VA / FL2VA）双卡**固定槽权重流水**推理节点包—�
 
 其他环境变量：
 - `H3_LAST_ON_SEC=1`：末层放副卡
-- `CUDA_VISIBLE_DEVICES=1,0`：3080 当主卡
+- `CUDA_VISIBLE_DEVICES=1,0`：切换主卡
 
 ## 节点
 
