@@ -35,6 +35,22 @@ MiniMax-H3（Ref2VA / FL2VA）双卡推理节点——单卡算全部层，但�
 - `H3_LAST_ON_SEC=1`：末层放副卡
 - `CUDA_VISIBLE_DEVICES=1,0`：切换主卡
 
+## 启动命令示例
+
+```bash
+# 默认布局：5070Ti 主卡 + 3080 副卡 TE（int8/last_on_sec 在工作流节点 UI 里勾选）
+cd /h/ComfyUI-v4-5070ti
+./python_embeded/python.exe -s ComfyUI/main.py --port 5071   --use-sage-attention --disable-dynamic-vram
+
+# 3080 当主卡（大 token 场景：20G 显存可跑 0.7M×22s+）：
+# 交换 CUDA 枚举顺序 → cuda:0=3080 主卡、cuda:1=5070Ti 副卡 TE
+# 注意：此时两个节点的 secondary_gpu 都应填 0
+CUDA_VISIBLE_DEVICES=1,0 ./python_embeded/python.exe -s ComfyUI/main.py   --port 5071 --use-sage-attention --disable-dynamic-vram
+
+# 命令行覆盖（节点参数未勾选时生效；勾选了以节点为准）：
+H3_SLOT_INT8=1 H3_LAST_ON_SEC=1 ./python_embeded/python.exe -s ComfyUI/main.py   --port 5071 --use-sage-attention --disable-dynamic-vram
+```
+
 ## 节点
 
 - `H3DualGPUPipeline` —— 主卡层 0-48 固定槽流水 + 层 49 主卡 B 槽（`H3_LAST_ON_SEC=1` 可切副卡）
