@@ -17,6 +17,7 @@ import comfy.model_management
 import comfy.patcher_extension
 import comfy.utils
 from comfy.quant_ops import QuantizedTensor
+from comfy_api.latest import io
 
 from .fixed_slot import SlotPipeline, STREAM_LINERARS
 
@@ -38,13 +39,17 @@ class DualGPUExecutor:
     """进程内执行状态。wrapper 每次 forward 从 transformer_options 取回。"""
 
     def __init__(self, model_patcher, secondary_device, source_path,
-                 mode="dual_gpu", hash_file=""):
+                 mode="dual_gpu", hash_file="", int8_mode=False,
+                 last_on_sec=False):
         self.model_patcher = model_patcher
         self.diffusion_model = model_patcher.get_model_object("diffusion_model")
         self.secondary_device = secondary_device
         self.source_path = source_path
         self.mode = mode                      # dual_gpu / baseline_capture
         self.hash_file = hash_file
+        # 节点 UI 开关（环境变量为向后兼容，节点参数优先——见 fixed_slot.bake/load_slot）
+        self.int8_mode = bool(int8_mode)
+        self.last_on_sec = bool(last_on_sec)
         self.pipeline = None                  # baseline 模式不建槽
         if mode == "dual_gpu":
             # 双卡模式：立即建流水管理器（单例按权重路径）
@@ -80,6 +85,12 @@ class DualGPUExecutor:
 
         import os as _os
         stage = _os.environ.get("H3_PREP_STAGE", "all")   # 二分调试：bake/unload/resident/slots
+
+        # 节点 UI 开关 → pipeline/source（explicit 标记：节点参数总是优先，
+        # 旧工作流未含这些参数时回退环境变量——见 fixed_slot.bake/load_slot）
+        self.pipeline.last_on_sec = self.last_on_sec
+        self.pipeline.source.int8_mode = self.int8_mode
+        self.pipeline.source._int8_explicit = True
 
         # 1) LoRA 烘焙（生成/命中缓存文件；常驻件烘回权重对象）
         if stage in ("all", "bake"):
@@ -384,31 +395,38 @@ def diffusion_model_wrapper(wrap_executor, x, timestep, context,
 
 
 # ======================================================================
-# 节点定义
+# 节点定义（io.ComfyNode 新版风格：中文 widget 名 + tooltip）
 # ======================================================================
 
-class H3DualGPUPipeline:
+class H3DualGPUPipeline(io.ComfyNode):
+    """MiniMax H3 双卡固定槽流水：主卡层0-48两槽交替，副卡层49。"""
+
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("MODEL",),
-                "secondary_gpu": ("INT", {"default": 1, "min": 0, "max": 7,
-                                          "label": "副卡序号 Secondary GPU"}),
-                "model_path": ("STRING", {"default": "",
-                                          "label": "权重文件路径(留空自动) Weight path"}),
-                "layer_debug": ("BOOLEAN", {"default": False,
-                                            "label": "逐层求和记录 Layer debug"}),
-            },
-        }
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="H3DualGPUPipeline",
+            display_name="H3 双卡固定槽流水 Dual-GPU Fixed-Slot Pipeline",
+            category="H3DualGPU",
+            description="MiniMax H3 双卡固定槽流水：主卡层0-48两槽交替，副卡层49",
+            inputs=[
+                io.Model.Input("model", tooltip="接在 UNETLoader/LoRA/Sage 补丁链末端"),
+                io.Int.Input("secondary_gpu", display_name="副卡序号", min=0, max=7, default=1,
+                             tooltip="TE 所在副卡的 CUDA 序号。默认布局 5070Ti 主卡=1；CUDA_VISIBLE_DEVICES=1,0 交换后=0"),
+                io.String.Input("model_path", display_name="权重文件路径", default="",
+                                tooltip="权重 safetensors 路径，留空自动从 UNETLoader 定位"),
+                io.Boolean.Input("layer_debug", display_name="逐层求和记录", default=False,
+                                 tooltip="启用逐层激活求和写入 JSON（数值对比基线用），正常出图请关闭"),
+                io.Boolean.Input("int8_mode", display_name="int8 槽模式", default=False,
+                                 tooltip="int8 量化 kernel 直算（槽 1.08 GiB，仅 int8_convrot 模型可用）；关闭=bf16 烘焙直存（与基线 1ulp 内一致）"),
+                io.Boolean.Input("last_on_sec", display_name="末层49放副卡", default=False,
+                                 tooltip="布局开关：层49在副卡计算。需 TE 编码完成自动卸载后副卡显存空闲，实测提速约28%"),
+            ],
+            outputs=[io.Model.Output(tooltip="带双卡固定槽流水的模型")],
+        )
 
-    RETURN_TYPES = ("MODEL",)
-    RETURN_NAMES = ("model",)
-    FUNCTION = "apply"
-    CATEGORY = "H3DualGPU"
-    DESCRIPTION = "MiniMax H3 双卡固定槽流水：主卡层0-48两槽交替，副卡层49"
-
-    def apply(self, model, secondary_gpu, model_path, layer_debug):
+    @classmethod
+    def execute(cls, model, secondary_gpu, model_path, layer_debug,
+                int8_mode=False, last_on_sec=False) -> io.NodeOutput:
         model_clone = model.clone()
         if not model_path:
             model_path = _locate_weight_file(model_clone)
@@ -416,7 +434,9 @@ class H3DualGPUPipeline:
 
         executor = DualGPUExecutor(model_clone, sec_device, model_path,
                                    mode="dual_gpu",
-                                   hash_file="")
+                                   hash_file="",
+                                   int8_mode=int8_mode,
+                                   last_on_sec=last_on_sec)
         if layer_debug:
             executor.hash_enabled = True   # 启用逐层求和
         to = model_clone.model_options.setdefault("transformer_options", {})
@@ -426,8 +446,7 @@ class H3DualGPUPipeline:
             WRAP_KEY,
             diffusion_model_wrapper,
         )
-        return (model_clone,)
-
+        return io.NodeOutput(model_clone)
 
 def _locate_weight_file(model_patcher):
     """从 ModelPatcher 找回 safetensors 路径。"""
@@ -437,24 +456,26 @@ def _locate_weight_file(model_patcher):
     raise RuntimeError("无法自动定位权重文件，请在节点里填 model_path")
 
 
-class H3TESecondaryGPU:
+class H3TESecondaryGPU(io.ComfyNode):
+    """Qwen3-VL TE 卸载到副卡（不占主卡显存，与 DiT 主卡并行）。"""
+
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "clip": ("CLIP",),
-                "secondary_gpu": ("INT", {"default": 1, "min": 0, "max": 7,
-                                          "label": "副卡序号 Secondary GPU"}),
-            },
-        }
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="H3TESecondaryGPU",
+            display_name="H3 TE 卸载副卡 TE → Secondary GPU",
+            category="H3DualGPU",
+            description="Qwen3-VL TE 卸载到副卡（不占主卡显存，与 DiT 主卡并行）",
+            inputs=[
+                io.Clip.Input("clip", tooltip="CLIP 文本编码器（GGUF 或 int8_convrot）"),
+                io.Int.Input("secondary_gpu", display_name="副卡序号", min=0, max=7, default=1,
+                             tooltip="TE 所在副卡的 CUDA 序号，须与主节点 secondary_gpu 一致。默认布局=1；CUDA_VISIBLE_DEVICES=1,0 交换后=0。填 0 会把 TE 放主卡挤占 DiT 显存"),
+            ],
+            outputs=[io.Clip.Output(tooltip="TE 加载到副卡的 CLIP")],
+        )
 
-    RETURN_TYPES = ("CLIP",)
-    RETURN_NAMES = ("clip",)
-    FUNCTION = "apply"
-    CATEGORY = "H3DualGPU"
-    DESCRIPTION = "Qwen3-VL TE 卸载到副卡（不占主卡显存，与 DiT 主卡并行）"
-
-    def apply(self, clip, secondary_gpu):
+    @classmethod
+    def execute(cls, clip, secondary_gpu) -> io.NodeOutput:
         clip_clone = clip.clone()
         clip_clone.patcher.load_device = torch.device("cuda", secondary_gpu)
         # 低显存副卡（如 16G 5070Ti）放不下 TE 全量常驻 14.5G：
@@ -472,27 +493,27 @@ class H3TESecondaryGPU:
         # wrapper 首次调用时卸载到内存，释放副卡显存（TE 用后即弃）
         global _TE_PATCHER
         _TE_PATCHER = clip_clone.patcher
-        return (clip_clone,)
+        return io.NodeOutput(clip_clone)
 
 
-class H3BaselineCapture:
+class H3BaselineCapture(io.ComfyNode):
     """基线 hash 采集：不动权重，原生 legacy 路径跑，抓逐层求和。"""
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("MODEL",),
-            },
-        }
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="H3BaselineCapture",
+            display_name="H3 基线逐层求和 Baseline Layer-Sum Capture",
+            category="H3DualGPU",
+            description="基线逐层求和采集（原生权重路径，用于数值一致性对比）",
+            inputs=[
+                io.Model.Input("model", tooltip="原始模型（不接 H3DualGPUPipeline），跑原生 legacy 路径抓逐层 hash"),
+            ],
+            outputs=[io.Model.Output(tooltip="原样透传的模型")],
+        )
 
-    RETURN_TYPES = ("MODEL",)
-    RETURN_NAMES = ("model",)
-    FUNCTION = "apply"
-    CATEGORY = "H3DualGPU"
-    DESCRIPTION = "基线逐层求和采集（原生权重路径，用于数值一致性对比）"
-
-    def apply(self, model):
+    @classmethod
+    def execute(cls, model) -> io.NodeOutput:
         model_clone = model.clone()
         executor = DualGPUExecutor(
             model_clone, None, _locate_weight_file(model_clone),
@@ -505,7 +526,7 @@ class H3BaselineCapture:
             WRAP_KEY,
             diffusion_model_wrapper,
         )
-        return (model_clone,)
+        return io.NodeOutput(model_clone)
 
 
 NODE_CLASS_MAPPINGS = {
