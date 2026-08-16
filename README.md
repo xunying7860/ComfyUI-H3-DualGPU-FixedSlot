@@ -50,4 +50,3 @@ MiniMax-H3（Ref2VA / FL2VA）双卡**固定槽权重流水**推理节点包—�
 
 - 权重格式：**int8_convrot**（Ref2VA / FL2VA 的 `*_pruned_int8_convrot.safetensors` 官方版）
 - FL2VA 需用官方 int8_convrot 版（w4a8_mixed codebook 格式暂不兼容）
-- 工作流可参考 `test_dual_api.json`（含分辨率/时长/参考图结构）
