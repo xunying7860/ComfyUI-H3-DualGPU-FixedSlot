@@ -61,4 +61,4 @@ H3_SLOT_INT8=1 H3_LAST_ON_SEC=1 ./python_embeded/python.exe -s ComfyUI/main.py  
 
 ## 致谢
 
-固定槽双卡流水思路来自 B 站 UP 主：[空间链接](https://space.bilibili.com/3493120159255008)（UID: 3493120159255008），感谢分享双卡串行固定槽架构。
+B 站 UP 主：[空间链接](https://space.bilibili.com/3493120159255008)（UID: 3493120159255008）
