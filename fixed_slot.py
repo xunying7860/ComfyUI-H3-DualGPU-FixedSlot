@@ -80,6 +80,19 @@ class WeightSource:
         self.read_path = self.path
         # int8 槽模式开关（bake() 时按 H3_SLOT_INT8 设定；默认 bf16）
         self.int8_mode = False
+        # 原生 bf16 检测：主权重 dtype=BF16 且无量化 marker
+        # → 跳过烘焙直接建槽（官方 bf16 版权重无需解量化链）
+        self.native_bf16 = self._detect_native_bf16()
+
+    def _detect_native_bf16(self):
+        """原生 bf16 模型判定：blocks 主权重为 BF16 且无 comfy_quant 量化标记。"""
+        qkv = self.header.get("blocks.0.attn.qkv_proj.weight")
+        if qkv is None or qkv.get("dtype") != "BF16":
+            return False
+        # 量化模型带 comfy_quant marker（int8_convrot 等）
+        if "blocks.0.attn.qkv_proj.comfy_quant" in self.header:
+            return False
+        return True
 
     # ------------------------------------------------------------------
     def layer_plan(self, li):
@@ -149,13 +162,25 @@ class WeightSource:
 
         bf16 默认：普通 bf16 槽张量 + F.linear 才与基线逐位一致。
         int8 开关（H3_SLOT_INT8=1）：dequant→LoRA→requant int8 落盘，
-        槽装 QuantizedTensor 保留 layout_type → 走 int8 kernel（原作者原设计，
+        槽装 QuantizedTensor 保留 layout_type → 走 int8 kernel（原设计，
         显存 1.08G/槽 更省，数值与基线差约 3% 属量化噪声）。
         返回 (n_baked_stream, n_baked_resident)。
         """
         import os as _os
-        self.int8_mode = _os.environ.get("H3_SLOT_INT8") == "1"
+        # int8 开关：节点 UI 参数优先（_int8_explicit 标记）；否则回退环境变量 H3_SLOT_INT8
+        if not getattr(self, "_int8_explicit", False):
+            self.int8_mode = _os.environ.get("H3_SLOT_INT8") == "1"
         patches = dict(model_patcher.patches)
+        # 原生 bf16 直装：模型权重本身就是 bf16（官方 bf16 版）且无 LoRA
+        # → 跳过烘焙直接建槽（无需解量化链，槽张量即原权重 bf16）
+        if self.native_bf16 and not patches:
+            if self.int8_mode:
+                LOG.warning("[H3FixedSlot] 原生 bf16 模型无量化权重，int8 槽不可用，回退 bf16 直装")
+                self.int8_mode = False
+            LOG.info("[H3FixedSlot] 原生 bf16 模型：跳过烘焙直接建槽（无 LoRA）")
+            self.read_path = self.path
+            self.plans_needs_rebuild = False
+            return 0, 0
         if self.int8_mode:
             # int8 版：LoRA 烘焙后 requant 回 int8（scale 重算）
             sig = "i8-" + self._lora_signature(model_patcher) \
@@ -288,7 +313,7 @@ class WeightSource:
                  n_stream, offset / 2**30)
 
     def _bake_int8_to_file(self, dm, model_patcher, patches, cache):
-        """int8 版烘焙：dequant→LoRA→requant int8 落盘（原作者原设计）。
+        """int8 版烘焙：dequant→LoRA→requant int8 落盘（原设计）。
         缓存格式与原文件同构：weight=I8 qdata + weight_scale=F32 重算 scale，
         直读原文件的 nolora 情形也烘焙（保持格式统一走 QuantizedTensor 装槽）。"""
         device = comfy.model_management.get_torch_device()
@@ -318,7 +343,7 @@ class WeightSource:
                     temp = comfy.lora.calculate_weight(
                         lp, temp, patch_key,
                         intermediate_dtype=temp.dtype)
-                # requant 回 int8（scale 重算）——原作者 int8 槽语义
+                # requant 回 int8（scale 重算）——int8 槽语义
                 qt = w.requantize_from_float(
                     temp, scale="recalculate")
                 q8 = qt._qdata.to("cpu").contiguous()
@@ -418,6 +443,8 @@ class SlotPipeline:
         self.n_layers = source.n_layers
         self.plans = {li: source.layer_plan(li) for li in range(self.n_layers)}
         self._alloc_host_slots()
+        # 末层放副卡开关（节点 UI 参数优先；环境变量 H3_LAST_ON_SEC 兼容）
+        self.last_on_sec = False
 
         # 显存槽
         self.vram_slots = {}     # "main_A"/"main_B": {lin_name: qdata}; "sec": 副卡单槽
@@ -537,11 +564,11 @@ class SlotPipeline:
 
     # ------------------------------------------------------------------
     def load_slot(self, li, host_buf, device=None):
-        """主机槽 → 显存槽。全部层默认走主卡 A/B 轮换——原作者副卡 16G 空闲
+        """主机槽 → 显存槽。全部层默认走主卡 A/B 轮换——副卡 16G 空闲
         可放层 49，本机副卡被 TE 占 14.5G 放不下（OOM），层 49 也回主卡轮换。
-        环境变量 H3_LAST_ON_SEC=1 可恢复原作者的副卡末层布局。"""
+        环境变量 H3_LAST_ON_SEC=1 或节点参数 last_on_sec 可恢复副卡末层布局。"""
         is_last = (li == self.n_layers - 1) and ("sec" in self.vram_slots) \
-            and os.environ.get("H3_LAST_ON_SEC") == "1"
+            and (self.last_on_sec or os.environ.get("H3_LAST_ON_SEC") == "1")
         if is_last:
             slots = self.vram_slots["sec"]
             stream = self.sec_copy_stream
@@ -568,7 +595,7 @@ class SlotPipeline:
         赋 .data 会静默失效（.data 仍返回旧 QuantizedTensor 的 bf16 视图），
         这是此前 mat2@cpu 与无效换装的根因。
         int8 模式：qdata+scale → 构造 QuantizedTensor 装槽，保留 layout_type
-        → _use_quantized=True 走 int8 kernel（原作者原设计）。"""
+        → _use_quantized=True 走 int8 kernel（原设计）。"""
         t0 = time.perf_counter()
         slots = self.vram_slots[key]
         block = diffusion_model.blocks[li]
